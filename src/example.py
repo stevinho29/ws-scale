@@ -1,8 +1,8 @@
 
 import argparse
 import asyncio
-from ids.master import IDGeneratorMaster
-from ws.server import WebsocketServer
+from wsscale import IDGeneratorMaster
+from wsscale import WebsocketServer
 import logging
 import sys
 
