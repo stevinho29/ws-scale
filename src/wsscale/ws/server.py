@@ -6,7 +6,7 @@ from importlib import import_module
 from typing import Callable, Awaitable, Optional, Any
 from websockets.asyncio.connection import Connection
 from websockets.asyncio.server import serve, Server
-from ids.node import IDGeneratorNode
+from wsscale.ids.node import IDGeneratorNode
 
 
 Handler = Awaitable[Callable[[Connection], Any]]

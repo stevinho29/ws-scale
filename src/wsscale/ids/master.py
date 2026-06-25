@@ -6,7 +6,7 @@ import os
 import json
 import logging
 
-from cache.redis import RedisInstance
+from wsscale.cache.redis import RedisInstance
 logger = logging.getLogger("ws-scale.ids.master")
 
 

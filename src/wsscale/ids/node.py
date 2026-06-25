@@ -3,7 +3,7 @@ import asyncio
 from aiohttp import ClientSession
 from datetime import datetime, timezone
 
-from cache.redis import RedisInstance
+from wsscale.cache.redis import RedisInstance
 
 logger = logging.getLogger("ws-scale.ids.node")
     
