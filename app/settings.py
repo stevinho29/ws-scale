@@ -1,0 +1,6 @@
+
+WS_REDIS_HOST = "localhost"
+WS_REDIS_PORT = 6379
+
+WS_MASTER_HOST = "http://0.0.0.0"
+WS_MASTER_PORT = 9000
