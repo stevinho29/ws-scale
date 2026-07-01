@@ -26,8 +26,8 @@ license = "MIT"
 license-files = ["LICEN[CS]E*"]
 
 [project.urls]
-Homepage = "https://github.com/pypa/sampleproject"
-Issues = "https://github.com/pypa/sampleproject/issues"
+Homepage = "https://github.com/stevinho29/ws-scale"
+Issues = "https://github.com/stevinho29/ws-scale/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
