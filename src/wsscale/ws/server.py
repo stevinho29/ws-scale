@@ -14,6 +14,25 @@ Handler = Awaitable[Callable[[Connection], Any]]
 
 logger = logging.getLogger("ws-scale.server")
 
+
+def to_bool(value:int|str|bool):
+    if isinstance(value, bool):
+        return value
+    elif isinstance(value, str):
+        if value in ["true", "True"]:
+            return True
+        elif value in ["false", "False"]:
+            return False
+        else:
+            raise ValueError(f"Can not convert {value} to boolean")
+    elif isinstance(value, int):
+        if value in [1, 0]:
+            return bool(value)
+        else:
+            raise ValueError(f"Can not convert {value} to boolean")
+    else:
+        ValueError(f"Can not convert {value} to boolean")
+
 class WebsocketServer:
     """
     Main entry point for the WebSocket server application.
@@ -23,7 +42,7 @@ class WebsocketServer:
     caller-supplied handler.
     """
 
-    def __init__(self, datacenter_id:int, port:int, settings_path:Optional[str]=None):
+    def __init__(self, port:int, settings_path:Optional[str]=None):
         """
         Args:
             datacenter_id: 5-bit datacenter identifier embedded in generated IDs.
@@ -37,31 +56,25 @@ class WebsocketServer:
         if settings_path:
             try:
                 settings = import_module(name=settings_path)
-                redis_host = getattr(settings, "WS_REDIS_HOST")
-                redis_port = getattr(settings, "WS_REDIS_PORT")
                 id_master_host = getattr(settings, "WS_MASTER_HOST")
                 id_master_port = getattr(settings, "WS_MASTER_PORT")
+                datacenter_id = getattr(settings, "WS_DATACENTER_ID")
+                self.cluster = getattr(settings, "WS_CLUSTER")
             except ModuleNotFoundError:
                 logger.error(f"Settings module not found, invalid path {settings_path}")
                 raise
-                
         else:
-            redis_host = os.environ.get("WS_REDIS_HOST")
-            redis_port = os.environ.get("WS_REDIS_PORT")
             id_master_host = os.environ.get("WS_MASTER_HOST")
             id_master_port = os.environ.get("WS_MASTER_PORT")
+            datacenter_id = int(os.environ.get("WS_DATACENTER_ID"))
+            self.cluster = to_bool(os.environ.get("WS_CLUSTER"))
+        
 
-        try:
-            self.node = IDGeneratorNode(
-                server_host=id_master_host, 
-                server_port=id_master_port, 
-                data_center_id=datacenter_id,
-                redis_host=redis_host,
-                redis_port=redis_port
-            )
-        except Exception as e:
-            logger.warning(e)
-            logger.error("Unable to start id generator node, please verify your configuration")
+        self.node = IDGeneratorNode(
+            server_host=id_master_host, 
+            server_port=id_master_port, 
+            data_center_id=datacenter_id,
+        )
 
     async def bootstrap(self, handler: Handler):
         """Register the ID node, start the heartbeat task, and run the WebSocket server.
@@ -70,11 +83,16 @@ class WebsocketServer:
             handler: Async callable that handles each incoming WebSocket connection.
         """
         log_header = f"{self.log_header}[bootstrap]"
-        await self.node.register()
-        asyncio.create_task(self.node.heart_beat_loop(interval_seconds=60))
+        if self.cluster:
+            await self.node.register()
+            asyncio.create_task(self.node.heart_beat_loop(interval_seconds=60))
+
         logger.info(f"{log_header} websockets server listening on localhost:{self.port}")
         async with serve(handler=handler, host="", port=self.port) as server:
             self.server = server
-            await server.serve_forever()
+            await self.server.serve_forever()
+    
+    def shutdown(self):
+        self.server.close()
         
         

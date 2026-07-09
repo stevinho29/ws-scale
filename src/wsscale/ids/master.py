@@ -3,11 +3,21 @@ from typing import Optional
 from aiohttp import web
 from importlib import import_module
 import os
+import asyncio
 import json
 import logging
+from pathlib import Path
 
-from wsscale.cache.redis import RedisInstance
+BASE_DIR = Path(__file__).resolve().parent
 logger = logging.getLogger("ws-scale.ids.master")
+
+#{
+#    nodes: {
+#        node_1: heart_beat
+#    },
+#    datacenter_id: "",
+#    count: 1
+#}
 
 
 class IDGeneratorMaster:
@@ -19,8 +29,8 @@ class IDGeneratorMaster:
     """
 
     MAX_NODES = 32
-
-    def __init__(self, datacenter_id: str, settings_path:str=None):
+    MONITOR_NODES_INTERVAL_SECONDS = 120
+    def __init__(self, datacenter_id: str, port:int|str):
         """
         Args:
             datacenter_id: Logical datacenter identifier for this master instance.
@@ -28,42 +38,41 @@ class IDGeneratorMaster:
                            Falls back to environment variables when omitted.
         """
         self.datacenter_id = datacenter_id
-        if settings_path:
-            try:
-                settings = import_module(name=settings_path)
-                redis_host = getattr(settings, "WS_REDIS_HOST")
-                redis_port = getattr(settings, "WS_REDIS_PORT")
-                id_master_host = getattr(settings, "WS_MASTER_HOST")
-                id_master_port = getattr(settings, "WS_MASTER_PORT")
-            except ModuleNotFoundError:
-                logger.error(f"Settings module not found, invalid path {settings_path}")
-                raise
-        else:
-            redis_host = os.environ.get("WS_REDIS_HOST")
-            redis_port = os.environ.get("WS_REDIS_PORT")
-            id_master_host = os.environ.get("WS_MASTER_HOST")
-            id_master_port = os.environ.get("WS_MASTER_PORT")
+        self.port = port
 
-        self.port = id_master_port
-        self.host = id_master_host
-        self.redis = RedisInstance(redis_host=redis_host, redis_port=redis_port).get_instance()
+        self._runner = None
+        self._monitor_task = None
         self.log_header = "[IDGeneratorMaster]"
 
     def _get_now(self) -> float:
         """Return the current UTC time as a millisecond-precision Unix timestamp."""
         return datetime.now(tz=timezone.utc).timestamp() * 1000
 
-    async def _generate_node_id(self) -> Optional[int]:
+    def get_nodes_data(self):
+        return self._get_json_storage_data()
+    
+    def _get_json_storage_data(self):
+        path = str(BASE_DIR.joinpath("storage.json"))
+        with open(path, "r") as f:
+            return json.load(f)
+    
+    def _write_json_storage_data(self, data):
+        print("ON WRITE", data)
+        with open(BASE_DIR.joinpath("storage.json"), "w") as f:
+            json.dump(data, f, indent=4)
+            
+    
+    async def  _generate_node_id(self) -> Optional[int]:
         """Atomically allocate the next node ID from Redis.
 
         Returns:
-            The new node ID (1-based), or ``None`` if ``MAX_NODES`` has been reached.
+            The new node ID (0-based), or ``None`` if ``MAX_NODES`` has been reached.
         """
-        node_key = "node_count"
-        count_bytes = await self.redis.get(node_key)
-        count = int(count_bytes.decode()) if count_bytes else 0
+        data = self._get_json_storage_data()
+        count = data.get("count")
+
         if count < self.MAX_NODES:
-            return await self.redis.incr(node_key, 1)
+            return count
         return None
 
     async def _cache_node(self, node_id: int) -> None:
@@ -72,7 +81,10 @@ class IDGeneratorMaster:
         Args:
             node_id: The node to cache.
         """
-        await self.redis.set(name=f"node_{node_id}", value=self._get_now())
+        data = self._get_json_storage_data()
+        data["count"] += 1
+        data["nodes"][str(node_id)] = self._get_now()
+        self._write_json_storage_data(data)
 
     async def _update_node(self, node_id: int, heart_beat: float) -> None:
         """Overwrite a node's last-seen timestamp with a new heartbeat value.
@@ -81,7 +93,9 @@ class IDGeneratorMaster:
             node_id: The node whose timestamp should be updated.
             heart_beat: New timestamp in milliseconds.
         """
-        await self.redis.set(name=f"node_{node_id}", value=heart_beat)
+        data = self._get_json_storage_data()
+        data["nodes"][str(node_id)] = heart_beat
+        self._write_json_storage_data(data)
 
     async def _delete_nodes(self, node_ids: list[int]) -> None:
         """Remove one or more nodes from Redis.
@@ -89,19 +103,24 @@ class IDGeneratorMaster:
         Args:
             node_ids: List of node IDs to delete. No-op if the list is empty.
         """
-        if node_ids:
-            await self.redis.delete(*[f"node_{id}" for id in node_ids])
+        data = self._get_json_storage_data()
+        for node_id in node_ids:
+            if str(node_id) in data["nodes"]:
+                del data["nodes"][str(node_id)]
+
+        self._write_json_storage_data(data)
 
     async def _get_node(self, node_id: int):
-        """Fetch a single node's last-seen timestamp from Redis.
+        """Fetch a single node's last-seen timestamp.
 
         Args:
             node_id: The node to look up.
 
         Returns:
-            The raw bytes value stored in Redis, or ``None`` if the key does not exist.
+            The timestamp, or ``None`` if the key does not exist.
         """
-        return await self.redis.get(name=f"node_{node_id}")
+        data = self._get_json_storage_data()
+        return data["nodes"].get(str(node_id))
 
     async def _get_nodes(self, node_ids: list[int]):
         """Fetch last-seen timestamps for multiple nodes in one round-trip.
@@ -110,9 +129,13 @@ class IDGeneratorMaster:
             node_ids: List of node IDs to look up.
 
         Returns:
-            A list of raw bytes values (or ``None`` for missing keys), in the same order as ``node_ids``.
+            A list of timestamp values (or ``None`` for missing keys), in the same order as ``node_ids``.
         """
-        return await self.redis.mget([f"node_{id}" for id in node_ids])
+        result = []
+        data = self._get_json_storage_data()
+        for node_id in node_ids:
+            result.append(data["nodes"].get(str(node_id)))
+        return result
 
     async def register(self, request: web.Request) -> web.Response:
         """HTTP POST /register — allocate a node ID and cache it.
@@ -120,13 +143,33 @@ class IDGeneratorMaster:
         Returns:
             201 with ``{"node_id": <int>}`` on success, or 400 if the node limit is reached.
         """
+        
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.Response(
+                status=400,
+                content_type="application/json",
+                body=json.dumps({"message": "invalid or empty body"}).encode()
+            )
+        
+        node_datacenter_id = body.get("datacenter_id")
+        if node_datacenter_id != self.datacenter_id:
+            logger.info(f"node datacenter id {node_datacenter_id} is different from the master datacenter id {self.datacenter_id}")
+            return web.Response(
+                status=400,
+                content_type="application/json",
+                body=json.dumps({"message": "you are trying to register to the wrong datacenter"}).encode(),
+            )
+        
         node_id = await self._generate_node_id()
-        if not node_id:
+        if node_id is None:
             return web.Response(
                 status=400,
                 content_type="application/json",
                 body=json.dumps({"message": "maximum number of nodes has been reached"}).encode(),
             )
+
         await self._cache_node(node_id=node_id)
         return web.Response(
             status=201,
@@ -151,8 +194,16 @@ class IDGeneratorMaster:
                 content_type="application/json",
                 body=json.dumps({"message": "invalid or empty body"}).encode()
             )
+        
+        node_datacenter_id = body.get("datacenter_id")
+        if node_datacenter_id != self.datacenter_id:
+            logger.info(f"node datacenter id {node_datacenter_id} is different from the master datacenter id {self.datacenter_id}")
+            return web.Response(
+                status=400,
+                content_type="application/json",
+                body=json.dumps({"message": "you are trying to register to the wrong datacenter"}).encode(),
+            )
         node_id = body.get("node_id")
-
         node = await self._get_node(node_id=node_id)
         if node:
             await self._update_node(node_id=node_id, heart_beat=self._get_now())
@@ -169,17 +220,26 @@ class IDGeneratorMaster:
             body=json.dumps({"message": f"unknown node with id {node_id}"}).encode(),
         )
 
+    async def monitor_nodes_loop(self, interval_seconds: int) -> None:
+        log_header = f"{self.log_header}[monitor_nodes_loop]"
+        while True:
+            await asyncio.sleep(delay=interval_seconds)
+            print(f"monitor node loop called after {interval_seconds}")
+            logger.info(f"{log_header} heart beat called after {interval_seconds}")
+            await self.monitor_nodes()
+
+
     async def monitor_nodes(self) -> None:
         """Evict nodes that have not sent a heartbeat in the last two minutes."""
         log_header = f"{self.log_header}[monitor_nodes]"
-        two_minutes_ago = self._get_now() - 60 * 2 * 1000
+        two_minutes_ago = self._get_now() - self.MONITOR_NODES_INTERVAL_SECONDS * 1000
         node_heart_beats = await self._get_nodes(list(range(self.MAX_NODES)))
         to_remove = []
         for i, heart_beat in enumerate(node_heart_beats):
             if heart_beat:
-                hb_value = float(heart_beat.decode() if isinstance(heart_beat, bytes) else heart_beat)
-                if hb_value < two_minutes_ago:
+                if heart_beat < two_minutes_ago:
                     to_remove.append(i)
+
         await self._delete_nodes(to_remove)
         logger.info(f"{log_header} nodes {to_remove} removed")
 
@@ -187,15 +247,33 @@ class IDGeneratorMaster:
         """Start the aiohttp HTTP server and block until it is stopped."""
         app = web.Application()
         app.router.add_post("/register", self.register)
-        app.router.add_post("/heartbeat", self.heartbeat)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, None, self.port)
+        app.router.add_put("/heartbeat", self.heartbeat)
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, None, self.port)
         await site.start()
         logger.info(f"{self.log_header} id master server listening on localhost:{self.port}")
 
+    async def shutdown(self) -> None:
+        await self._runner.cleanup()
+        self._monitor_task.cancel()
+
     async def cleanup(self):
-        """Delete all node entries from Redis (intended for graceful shutdown)."""
+        """Delete all node entries from json storage (intended for graceful shutdown)."""
         log_header = f"{self.log_header}[cleanup]"
-        await self._delete_nodes(list(range(self.MAX_NODES)))
+        data = {
+            "nodes": {},
+            "datacenter_id": self.datacenter_id,
+            "count": 0
+        }
+        self._write_json_storage_data(data)
         logger.info(f"{log_header} redis database cleaned up with success")
+    
+    async def bootstrap(self, monitor_interval_seconds:int=60):
+        """Start the HTTP server and the node monitor loop.
+        Args:
+            monitor_interval_seconds: Seconds to wait between each node monitor iteration.
+        """
+        await self.cleanup()
+        await self.serve()
+        self._monitor_task = asyncio.create_task(self.monitor_nodes_loop(interval_seconds=monitor_interval_seconds))

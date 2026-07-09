@@ -28,20 +28,16 @@ async def start():
 
     id_master_server = None
     if id_generator:
-        id_master_server = IDGeneratorMaster(datacenter_id=datacenter, settings_path="settings")
+        id_master_server = IDGeneratorMaster(datacenter_id=datacenter, port=8888)
     
     ws_server = WebsocketServer(
-        datacenter_id=datacenter,
         port=port,
         settings_path="settings"
     )
     
     if id_master_server:
-        # cleanup remaining keys in redis for fresh start
-        await id_master_server.cleanup()
-        await id_master_server.serve()
+        await id_master_server.bootstrap(monitor_interval_seconds=60)
         await ws_server.bootstrap(handler=do_nothing)
-        
     else:
         await ws_server.bootstrap(handler=do_nothing)
 
