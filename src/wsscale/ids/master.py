@@ -8,6 +8,8 @@ import json
 import logging
 from pathlib import Path
 
+from wsscale.storage.json import JSONStorage
+
 BASE_DIR = Path(__file__).resolve().parent
 logger = logging.getLogger("ws-scale.ids.master")
 
@@ -43,23 +45,14 @@ class IDGeneratorMaster:
         self._runner = None
         self._monitor_task = None
         self.log_header = "[IDGeneratorMaster]"
+        self.json_storage = JSONStorage(path=str(BASE_DIR.joinpath("storage.json")))
 
     def _get_now(self) -> float:
         """Return the current UTC time as a millisecond-precision Unix timestamp."""
         return datetime.now(tz=timezone.utc).timestamp() * 1000
 
     def get_nodes_data(self):
-        return self._get_json_storage_data()
-    
-    def _get_json_storage_data(self):
-        path = str(BASE_DIR.joinpath("storage.json"))
-        with open(path, "r") as f:
-            return json.load(f)
-    
-    def _write_json_storage_data(self, data):
-        print("ON WRITE", data)
-        with open(BASE_DIR.joinpath("storage.json"), "w") as f:
-            json.dump(data, f, indent=4)
+        return self.json_storage.get_data()
             
     
     async def  _generate_node_id(self) -> Optional[int]:
@@ -68,12 +61,13 @@ class IDGeneratorMaster:
         Returns:
             The new node ID (0-based), or ``None`` if ``MAX_NODES`` has been reached.
         """
-        data = self._get_json_storage_data()
-        count = data.get("count")
+        async with self.json_storage.lock:
+            data = self.json_storage.get_data()
+            count = data.get("count")
 
-        if count < self.MAX_NODES:
-            return count
-        return None
+            if count < self.MAX_NODES:
+                return count
+            return None
 
     async def _cache_node(self, node_id: int) -> None:
         """Store a node's initial last-seen timestamp in Redis.
@@ -81,10 +75,11 @@ class IDGeneratorMaster:
         Args:
             node_id: The node to cache.
         """
-        data = self._get_json_storage_data()
-        data["count"] += 1
-        data["nodes"][str(node_id)] = self._get_now()
-        self._write_json_storage_data(data)
+        async with self.json_storage.lock:
+            data = self.json_storage.get_data()
+            data["count"] += 1
+            data["nodes"][str(node_id)] = self._get_now()
+            self.json_storage.write_data(data)
 
     async def _update_node(self, node_id: int, heart_beat: float) -> None:
         """Overwrite a node's last-seen timestamp with a new heartbeat value.
@@ -93,9 +88,10 @@ class IDGeneratorMaster:
             node_id: The node whose timestamp should be updated.
             heart_beat: New timestamp in milliseconds.
         """
-        data = self._get_json_storage_data()
-        data["nodes"][str(node_id)] = heart_beat
-        self._write_json_storage_data(data)
+        async with self.json_storage.lock:
+            data = self.json_storage.get_data()
+            data["nodes"][str(node_id)] = heart_beat
+            self.json_storage.write_data(data)
 
     async def _delete_nodes(self, node_ids: list[int]) -> None:
         """Remove one or more nodes from Redis.
@@ -103,12 +99,13 @@ class IDGeneratorMaster:
         Args:
             node_ids: List of node IDs to delete. No-op if the list is empty.
         """
-        data = self._get_json_storage_data()
-        for node_id in node_ids:
-            if str(node_id) in data["nodes"]:
-                del data["nodes"][str(node_id)]
+        async with self.json_storage.lock:
+            data = self.json_storage.get_data()
+            for node_id in node_ids:
+                if str(node_id) in data["nodes"]:
+                    del data["nodes"][str(node_id)]
 
-        self._write_json_storage_data(data)
+            self.json_storage.write_data(data)
 
     async def _get_node(self, node_id: int):
         """Fetch a single node's last-seen timestamp.
@@ -119,8 +116,9 @@ class IDGeneratorMaster:
         Returns:
             The timestamp, or ``None`` if the key does not exist.
         """
-        data = self._get_json_storage_data()
-        return data["nodes"].get(str(node_id))
+        async with self.json_storage.lock:
+            data = self.json_storage.get_data()
+            return data["nodes"].get(str(node_id))
 
     async def _get_nodes(self, node_ids: list[int]):
         """Fetch last-seen timestamps for multiple nodes in one round-trip.
@@ -132,10 +130,11 @@ class IDGeneratorMaster:
             A list of timestamp values (or ``None`` for missing keys), in the same order as ``node_ids``.
         """
         result = []
-        data = self._get_json_storage_data()
-        for node_id in node_ids:
-            result.append(data["nodes"].get(str(node_id)))
-        return result
+        async with self.json_storage.lock:
+            data = self.json_storage.get_data()
+            for node_id in node_ids:
+                result.append(data["nodes"].get(str(node_id)))
+            return result
 
     async def register(self, request: web.Request) -> web.Response:
         """HTTP POST /register — allocate a node ID and cache it.
@@ -266,7 +265,7 @@ class IDGeneratorMaster:
             "datacenter_id": self.datacenter_id,
             "count": 0
         }
-        self._write_json_storage_data(data)
+        self.json_storage.write_data(data)
         logger.info(f"{log_header} redis database cleaned up with success")
     
     async def bootstrap(self, monitor_interval_seconds:int=60):
